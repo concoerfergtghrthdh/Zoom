@@ -3,7 +3,8 @@ import random
 import string
 import re
 import os
-from playwright.async_api import async_playwright, Playwright
+# --- MODIFIED LINE: Added 'Page' to the import list ---
+from playwright.async_api import async_playwright, Playwright, Page
 
 # ==============================================================================
 # ---  CONFIGURATION ---
@@ -38,7 +39,8 @@ def get_web_client_url(meeting_url, passcode):
     base_domain = base_domain_match.group(0) if base_domain_match else ""
     return f"{base_domain}/wc/join/{meeting_id}?pwd={passcode}"
 
-async def keep_alive_in_meeting(page: Playwright.page, bot_name: str):
+# --- MODIFIED LINE: Corrected the type hint from Playwright.page to Page ---
+async def keep_alive_in_meeting(page: Page, bot_name: str):
     """Simulates user activity to prevent being kicked for inactivity."""
     print(f"✅ [{bot_name}] Successfully joined. Starting keep-alive routine.")
     while True:
@@ -67,19 +69,15 @@ async def run_bot(playwright: Playwright, bot_id: int, semaphore: asyncio.Semaph
         direct_url = get_web_client_url(MEETING_URL, MEETING_PASSCODE)
         if not direct_url: return
 
-        # --- THIS IS THE CORRECTED LINE 1 ---
         browser = await playwright.chromium.launch(
             headless=True,
             args=["--use-fake-ui-for-media-stream", "--use-fake-device-for-media-stream"]
         )
-        
-        # --- THIS IS THE CORRECTED LINE 2 ---
         context = await browser.new_context(
             user_agent=random.choice(USER_AGENTS),
             ignore_https_errors=True,
             viewport={'width': 1280, 'height': 720}
         )
-
         page = await context.new_page()
         try:
             await page.goto(direct_url, timeout=60000)
@@ -99,9 +97,7 @@ async def run_bot(playwright: Playwright, bot_id: int, semaphore: asyncio.Semaph
             await page.wait_for_timeout(3000)
             await page.get_by_role("button", name="Join Audio by Computer").wait_for(timeout=60000)
             
-            # Switch to the active keep-alive routine
             await keep_alive_in_meeting(page, bot_name)
-
         except Exception as e:
             print(f"❌ [{bot_name}] A critical error occurred: {e}")
             await page.screenshot(path=f'error_{bot_name}.png')
