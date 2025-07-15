@@ -54,8 +54,8 @@ async def run_and_manage_bot(playwright: Playwright, name: str, bot_id: int):
     """
     for attempt in range(1, MAX_ATTEMPTS_PER_BOT + 1):
         browser = None
-        # Display the bot ID and name for clearer logs
-        log_name = f"{name} (Bot {bot_id})"
+        # Display the bot's given name and its number for clearer logs
+        log_name = f"{name} (Bot #{bot_id})"
         try:
             print(f"[{log_name}] Launching attempt #{attempt}/{MAX_ATTEMPTS_PER_BOT}...")
             browser = await playwright.chromium.launch(
@@ -71,8 +71,10 @@ async def run_and_manage_bot(playwright: Playwright, name: str, bot_id: int):
                 try: await page.get_by_text("Continue without microphone and camera").click(timeout=5000)
                 except: break
             
+            # --- MODIFIED: Uses the passed 'name' variable ---
             await page.locator('#input-for-name').wait_for(timeout=45000)
-            await page.locator('#input-for-name').fill(name) # Use the provided name
+            await page.locator('#input-for-name').fill(name)
+            
             await page.get_by_role("button", name="Join").click(timeout=45000)
             
             try:
@@ -80,6 +82,7 @@ async def run_and_manage_bot(playwright: Playwright, name: str, bot_id: int):
             except:
                 print(f"[{log_name}] Did not find audio button, but assuming success.")
             
+            # --- SUCCESS ---
             await keep_alive_in_meeting(page, log_name)
             break
         except Exception as e:
@@ -92,7 +95,8 @@ async def run_and_manage_bot(playwright: Playwright, name: str, bot_id: int):
             if browser:
                 await browser.close()
 
-# --- MODIFIED: `main` function to slice the name list ---
+
+# --- THIS IS THE MAIN LOGIC TO READ THE FILE AND LAUNCH BOTS ---
 async def main():
     """Reads names from a file and launches the specified number of bots."""
     try:
@@ -103,6 +107,7 @@ async def main():
             return
     except FileNotFoundError:
         print(f"❌ ERROR: The names file '{NAMES_FILE}' was not found.")
+        print("Please create it in your repository and add one name per line.")
         return
     
     # Check if there are enough names for the number of bots requested.
@@ -120,7 +125,7 @@ async def main():
     async with async_playwright() as p:
         tasks = []
         for i, name in enumerate(names_for_this_run):
-            # Pass the playwright instance, the name, and the bot's index (for logging)
+            # Pass the playwright instance, the name from the list, and the bot's index (for logging)
             task = asyncio.create_task(run_and_manage_bot(p, name, i + 1))
             tasks.append(task)
             
