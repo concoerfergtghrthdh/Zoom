@@ -1,0 +1,67 @@
+# This is the name of the workflow that will appear in the GitHub Actions tab.
+name: TEST
+
+# This section defines the trigger. `workflow_dispatch` means it's a manual trigger.
+on:
+  workflow_dispatch:
+    # These are the input fields that will appear when you click "Run workflow"
+    inputs:
+      meeting_id:
+        description: 'Zoom Meeting ID (the numbers only)'
+        required: true
+        type: string
+      passcode:
+        description: 'Meeting Passcode'
+        required: true
+        type: string
+      num_bots:
+        description: 'Number of bots to run'
+        required: true
+        type: number
+        default: 5
+      zoom_region:
+        description: 'Zoom region prefix (e.g., us04web, us05web)'
+        required: true
+        type: string
+        default: 'us05web' # Common default, adjust if needed
+
+# This section defines the jobs that the workflow will execute.
+jobs:
+  run-bots-on-server:
+    # This sets the job to run on a fresh, latest-version Ubuntu virtual server.
+    runs-on: ubuntu-latest
+    
+    # These are the sequential steps the server will perform.
+    steps:
+      # Step 1: Check out your repository's code so the runner has access to zoom_bot.py
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Step 2: Set up Python so we can run the script
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11' # You can specify the Python version here
+
+      # Step 3: Install the required Python libraries (Playwright)
+      - name: Install Python dependencies
+        run: pip install playwright
+
+      # Step 4: Install the browser binaries (Chromium) and system dependencies
+      # The `--with-deps` flag is a handy shortcut that does both steps we learned before.
+      - name: Install Playwright browsers and system dependencies
+        run: python3 -m playwright install --with-deps chromium
+
+      # Step 5: Run the actual bot script
+      - name: Run Zoom Bot Script
+        env:
+          # This is the crucial part: it passes the inputs from the form
+          # into the runner's environment as variables.
+          ZOOM_URL: "https://${{ github.event.inputs.zoom_region }}.zoom.us/j/${{ github.event.inputs.meeting_id }}"
+          ZOOM_PASSCODE: ${{ github.event.inputs.passcode }}
+          NUM_BOTS_ENV: ${{ github.event.inputs.num_bots }}
+        run: |
+          echo "Starting bot script for meeting ${{ github.event.inputs.meeting_id }}"
+          python3 test.py
+        # You can add a timeout if you want the job to stop automatically after some time
+        # timeout-minutes: 60 
