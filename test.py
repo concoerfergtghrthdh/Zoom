@@ -13,15 +13,17 @@ MEETING_PASSCODE = os.getenv("ZOOM_PASSCODE")
 TARGET_BOT_COUNT = int(os.getenv("NUM_BOTS_ENV", 40))
 NAMES_FILE = "names.txt"
 
-# Max number of simultaneous JOIN ATTEMPTS to prevent server overload/CAPTCHAs
+# The MAXIMUM number of bots (browsers) attempting to join at the same time.
+# This controls the load on the server.
 CONCURRENCY_LIMIT = 15
-# Time to wait after a FAILED attempt before adding the name back to the queue
-RETRY_DELAY_SECONDS = 30
 # ==============================================================================
 
-# --- Helper Functions (No changes needed) ---
-USER_AGENTS = ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36"]
+# --- Global State Management ---
+successful_bot_count = 0
+target_reached = asyncio.Event()
 
+# --- Helper Functions ---
+USER_AGENTS = ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36"]
 def get_web_client_url(meeting_url, passcode):
     match = re.search(r'/j/(\d+)', meeting_url)
     if not match: return None
@@ -30,36 +32,44 @@ def get_web_client_url(meeting_url, passcode):
     return f"{base_domain_match.group(0)}/wc/join/{meeting_id}?pwd={passcode}" if base_domain_match else None
 
 async def keep_alive_in_meeting(page: Page, context, browser, bot_name: str):
-    """
-    Simulates user activity and is responsible for its own resource cleanup.
-    """
-    print(f"✅ [{bot_name}] Successfully joined! Entering keep-alive routine.")
+    """The 'forever' task for a successful bot. Cleans up its own resources."""
+    global successful_bot_count
+    successful_bot_count += 1
+    print(f"✅ [{bot_name}] SUCCESS! Current count: {successful_bot_count}/{TARGET_BOT_COUNT}")
+    
+    if successful_bot_count >= TARGET_BOT_COUNT:
+        print("🎉 Target bot count reached!")
+        target_reached.set()
+
     while True:
         try:
+            # Check every minute if the main script signaled to stop
+            if target_reached.is_set() and successful_bot_count < TARGET_BOT_COUNT:
+                 # In case some bots leave, clear the flag to allow relaunching.
+                 target_reached.clear()
+
             await asyncio.sleep(random.randint(90, 150))
-            if page.is_closed():
-                print(f"🛑 [{bot_name}] Page was closed. Ending keep-alive.")
-                break
+            if page.is_closed(): break
             await page.mouse.move(random.randint(0, 500), random.randint(0, 500))
-            participants_button = page.get_by_role("button", name="Participants")
-            if await participants_button.is_visible():
-                await participants_button.click()
-        except Exception as e:
-            print(f"🛑 [{bot_name}] Keep-alive stopped. Bot likely kicked or meeting ended: {e}")
+        except Exception:
             break
     
-    # When keep_alive ends, clean up this bot's resources.
-    print(f"🧹 [{bot_name}] Cleaning up resources...")
+    print(f"🛑 [{bot_name}] Keep-alive stopped. Bot has left the meeting.")
+    successful_bot_count -= 1
+    # If we drop below the target, signal that we need more bots.
+    if target_reached.is_set() and successful_bot_count < TARGET_BOT_COUNT:
+        target_reached.clear()
+
     await context.close()
     await browser.close()
 
-async def join_attempt_worker(playwright: Playwright, name: str, semaphore: asyncio.Semaphore, name_queue: asyncio.Queue, successful_bots: list):
+
+async def attempt_to_join(playwright: Playwright, name: str, semaphore: asyncio.Semaphore):
     """
-    A worker that performs ONE join attempt. If successful, it launches the keep-alive
-    task. If it fails, it can put the name back in the queue.
+    Performs ONE join attempt. Releases the semaphore when done.
     """
-    async with semaphore:
-        print(f"🚀 [{name}] Attempting to join (Concurrency slot acquired)...")
+    async with semaphore: # Acquire a slot from the pool of 15
+        print(f"🚀 [{name}] Starting join attempt (Slot acquired)...")
         browser = None
         context = None
         try:
@@ -68,97 +78,70 @@ async def join_attempt_worker(playwright: Playwright, name: str, semaphore: asyn
             page = await context.new_page()
 
             await page.goto(get_web_client_url(MEETING_URL, MEETING_PASSCODE), timeout=90000)
-
-            captcha_locator = page.locator('iframe[title="reCAPTCHA"]')
-            try:
-                await captcha_locator.wait_for(timeout=7000)
-                print(f"🚨 [{name}] CAPTCHA DETECTED. Failing attempt.")
-                raise Exception("CAPTCHA")
-            except:
-                pass
-
+            
+            # Simplified login flow
+            try: await page.locator('iframe[title="reCAPTCHA"]').wait_for(timeout=7000) ; raise Exception("CAPTCHA DETECTED")
+            except: pass
             for _ in range(3):
                 try: await page.get_by_text("Continue without microphone and camera").click(timeout=5000)
                 except: break
-
-            await page.locator('#input-for-name').wait_for(timeout=45000)
-            await page.locator('#input-for-name').fill(name)
+            await page.locator('#input-for-name').fill(name, timeout=45000)
             await page.get_by_role("button", name="Join").click(timeout=45000)
             try: await page.get_by_role("button", name="Join Audio by Computer").wait_for(timeout=60000)
-            except: print(f"[{name}] Did not find audio button, but assuming success.")
+            except: pass
                 
             # --- SUCCESS ---
-            # Launch keep_alive as a background task. This bot is now independent.
-            # Pass ALL resources (browser, context, page) to it for cleanup.
-            keep_alive_task = asyncio.create_task(keep_alive_in_meeting(page, context, browser, name))
-            successful_bots.append(keep_alive_task)
-            
-            # Since this attempt succeeded, we do NOT close the browser here.
-            # We return True to signal success to the producer.
-            return True
+            # Launch the keep-alive task in the background. It is now independent.
+            # We hand over responsibility for the browser/context to this new task.
+            asyncio.create_task(keep_alive_in_meeting(page, context, browser, name))
+            return # IMPORTANT: Exit without cleaning up browser/context here.
 
         except Exception as e:
-            print(f"❌ [{name}] Join attempt failed: {e}")
             # --- FAILURE ---
-            # Clean up resources immediately on failure.
+            print(f"❌ [{name}] Join attempt failed: {e}")
             if context: await context.close()
             if browser: await browser.close()
-            # Put the name back in the queue to be retried later.
-            print(f"↪️ [{name}] Placing name back in queue for a later retry.")
-            await asyncio.sleep(RETRY_DELAY_SECONDS)
-            await name_queue.put(name)
-            return False
+            # The semaphore is automatically released when this 'with' block ends.
 
-async def producer(playwright: Playwright, name_queue: asyncio.Queue, semaphore: asyncio.Semaphore):
-    """The main task that produces join attempts until the target is met."""
-    successful_bots = []
-    
-    while len(successful_bots) < TARGET_BOT_COUNT:
-        if name_queue.empty():
-            print("⚠️ Name queue is empty. Cannot launch more bots. Waiting for retries or finishing.")
-            await asyncio.sleep(30)
-            # If still empty after waiting, all possible bots might have failed.
-            if name_queue.empty() and all(bot.done() for bot in successful_bots):
-                break
-            continue
-
-        name_to_try = await name_queue.get()
-        print(f"\n--- Launching new join attempt for: {name_to_try} ---")
-        print(f"--- Current Success Count: {len(successful_bots)}/{TARGET_BOT_COUNT} ---")
-
-        # Start the worker but don't wait for it here. It runs in the background.
-        # The semaphore controls how many can run at once.
-        asyncio.create_task(join_attempt_worker(playwright, name_to_try, semaphore, name_queue, successful_bots))
-
-        # Small stagger to prevent a thundering herd, even with semaphore.
-        await asyncio.sleep(1) 
-    
-    print(f"\nTarget of {TARGET_BOT_COUNT} bots reached or name queue exhausted. Monitoring living bots.")
-    # Wait for all the long-lived bot tasks to eventually finish (i.e., when they get kicked)
-    if successful_bots:
-        await asyncio.gather(*successful_bots)
 
 async def main():
-    """Sets up the producer/consumer model."""
+    """Reads all names and creates a continuous stream of join attempts."""
     try:
         with open(NAMES_FILE, 'r', encoding='utf-8') as f:
             all_names = [line.strip() for line in f if line.strip()]
         if not all_names: return print(f"❌ ERROR: '{NAMES_FILE}' is empty.")
     except FileNotFoundError: return print(f"❌ ERROR: '{NAMES_FILE}' not found.")
     
-    name_queue = asyncio.Queue()
-    for name in all_names:
-        await name_queue.put(name)
-
-    print(f"Loaded {name_queue.qsize()} names into the queue.")
-    print(f"Target: {TARGET_BOT_COUNT} successful bots.")
-    print(f"Concurrency Limit: {CONCURRENCY_LIMIT} simultaneous join attempts.")
-
+    print(f"Loaded {len(all_names)} names. Goal: {TARGET_BOT_COUNT} bots in meeting.")
+    print(f"Running up to {CONCURRENCY_LIMIT} join attempts at a time.")
+    
     semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
-
+    
     async with async_playwright() as p:
-        await producer(p, name_queue, semaphore)
-        
+        tasks = []
+        name_index = 0
+        while not target_reached.is_set():
+            if name_index >= len(all_names):
+                print("⚠️ All names have been used. Waiting for bots to leave to try again...")
+                await target_reached.wait() # Wait until the target is met and then maybe drops
+                # Reset index to reuse names if necessary
+                name_index = 0
+            
+            # Get the next name
+            name_to_try = all_names[name_index]
+            name_index += 1
+            
+            # Create a fire-and-forget task for the attempt
+            task = asyncio.create_task(attempt_to_join(p, name_to_try, semaphore))
+            tasks.append(task)
+            # Give a tiny break just to prevent overwhelming the asyncio loop itself on startup
+            await asyncio.sleep(0.1)
+
+        print("\n🏁 Target bot count was reached. No new bots will be launched unless the count drops.")
+        # We can gather the initial launch tasks, but the keep_alive tasks will live on.
+        await asyncio.gather(*tasks)
+
+
 if __name__ == "__main__":
     if not MEETING_URL or "your-company" in MEETING_URL:
         asyncio.run(main())
